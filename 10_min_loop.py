@@ -1,61 +1,26 @@
 import pandas as pd
-import tweepy
-import credentials as cred
 import scraper_input_data as input_data
-from textblob import TextBlob
 import pandas as pd
 from datetime import datetime, timedelta
 import psycopg2
 import postgress_config as config 
+import functions as ft 
+import time 
+import numpy as np
+import table_names as table
 
-
-"""Things needing to be added: 
-    - (1) Make code run in a infinite loop
-    - (2) integrate a timer to wait 10 minuted between each loop
-    - (3) add start and end date and time to the twitter search
-    - (4) get data to dataframe working (currently not liking the variable types) 
-    - (5) add sentiment analysis to the text analysis"""
-
-"""defining the number of tweets to scrape"""
-item_num = 1 
+"""the database used"""
+database = table.test_ten_min
 
 """defining the time period over which to scrape"""
-wait_time = 10 
+filename = './scrape_data.json'
 
-"""Configure the API"""
-auth = tweepy.AppAuthHandler(cred.consumer_key, cred.consumer_secret)
-api = tweepy.API(auth, wait_on_rate_limit=True)    # set wait_on_rate_limit =True; as twitter may block you from querying if it finds you exceeding some limits
-
-"""Used to define the tweet, it's polarity and time"""
-class TweetAnalyzer():
-    def __init__(self, df):
-        self.df = df
-
-    def tweet_info(self, tweets):
-        for tweet in tweets:
-            polarity = (TextBlob(tweet.text)).sentiment.polarity
-            time = tweet.created_at.utcnow()
-            tweet = tweet.text
-            #ADD SENTIMENT VARIABLE
-        return polarity, time, tweet 
-
-"""Function to creat lists of twitter handles, collection names and 
-    collection IDs from the source data (scraper_input_data.py)"""
-def twitter_hand(name_dict):
-    name_list = []
-    for key in name_dict.keys():
-        name_list.append(key)
-    twitter_handles = []
-    for i, name in enumerate(name_list):
-        twitter_handles.append(name_dict[name]["Twitter"])
-    id = []
-    for i, name in enumerate(name_list):
-        id.append(name_dict[name]["ID"])
-    return twitter_handles, name_list, id
+"""time period over which to scrape"""
+wait_time = 600
 
 """Creating lists of handles, names and collection IDs from the 
     source data (scraper_input_data.py)"""
-handles, name_list, ids  = twitter_hand(input_data.name_dict) 
+handles, name_list, ids  = ft.input_lists(input_data.name_dict) 
 
 conn = None 
 cur = None 
@@ -72,52 +37,59 @@ try:
     curr = conn.cursor()
 
     """Begining of infinite loop"""
-    # While True loop starts here 
-
-    """Defining the start and end time of each scrape"""
-    EndTime = str(datetime.utcnow())+"Z"
-    StartTime =  str(datetime.utcnow() - timedelta(minutes=wait_time))+"Z"
-
-    for i, handle in enumerate(handles):
-        
-        tweets = []
-
-        """This will be the main function that grams all tweets about a collection between a start and end date/time"""
-        # tweets.append(tweepy.Cursor(api.search_30_day(label = auth, query = str(handle), formDate = StartTime, endDate = EndTime)))
-
-        """Interim function until between dates can be defined, i.e. until advanced API is bought"""
-        tweets.append(tweepy.Cursor(api.search_tweets, (handle),lang="en").items(item_num))
-
-        for tweet in tweets:
+    while 1: 
+        Start  = time.time()
+        for i, handle in enumerate(handles):
             
-            """Defining the variables to be inserted into the table"""
-            tweet_analyzer = TweetAnalyzer(pd.DataFrame(columns=['Polarity - {}'.format(name_list[i])]))
-            polarity, time, text  =  tweet_analyzer.tweet_info(tweet)
-            polarity, time, text  = str(polarity), time ,str(text) 
-            id = int(ids[i])
-            name = str(name_list[i])
-            twitter_handle = str(handle)
+            """the search term"""
+            search_term = handle
 
-            """Me trying to get the query to work (not currently working)"""
-            # polarity = polarity.replace(" ", "_")
-            # time = time.replace("-", "")
-            # tweet = tweet.replace(" ", "_") 
-            # name = name.replace(" ", "_")
+            """the start time of each scrape"""
+            search_from =  str((datetime.utcnow() - timedelta(days=1)).date()) 
 
-            """Defining and executing the SQL queery"""
-            # query = "INSERT INTO public.Twitter_PC VALUES ({}, {}, {}, {}, {}, {});". format(id, name, str(time), text, polarity, twitter_handle) 
-            # curr.execute(query)
-           
-            query = "INSERT INTO public.Twitter_PC VALUES (%s,%s,%s,%s,%s,%s);"
-            curr.execute(query,(id, name, str(time), polarity, text, twitter_handle))
-            
-            conn.commit()
+            """running the scrape using a command line prompt"""
+            ft.scraper(search_from, search_term, filename)
 
-            # """Testing to see what comes out"""
-            # print()
+            #read in the dataframe 
+            df = pd.read_json(filename, lines=True)
 
-            """End of infinite loop"""
-            # While True loop ends here 
+            #sorting the time 
+            df['date'] = pd.to_datetime(df.date).dt.tz_localize(None)
+            pd.to_datetime(df['date'])
+
+            #defining the last 10 minutes
+            now = np.datetime64(datetime.utcnow())  
+            ten_minutes_ago = np.datetime64(datetime.utcnow()-timedelta(minutes=10))     
+
+            #new dataframe of the last ten minutes 
+            ten_min_df = df[(df['date'] > pd.Timestamp(str(ten_minutes_ago))) & (df['date'] < pd.Timestamp(str(now)))]
+
+            #for each tweet in the last ten minutes
+            for i in range(ten_min_df.shape[0]):
+                
+                """Defining the variables to be inserted into the table"""
+                timestamp = ten_min_df["date"].iloc[i]
+                text = ten_min_df["content"].iloc[i]
+                polarity = ft.polarity(ten_min_df["content"].iloc[i])
+                id = int(ids[i])
+                name = str(name_list[i])
+                twitter_handle = str(handle)
+
+                """Defining and executing the SQL queery"""
+                query = "INSERT INTO {database} VALUES (%s,%s,%s,%s,%s,%s);"
+                curr.execute(query,(id, name, str(timestamp), polarity, text, twitter_handle))
+                
+                conn.commit()
+                print((time.time()-Start))
+
+        """Making code sleep, such that each loop (inc scrape and sleep) takes 10 minutes"""
+        if wait_time > (time.time() - Start): 
+            # time.sleep(wait_time - (time.time() - Start))
+            time.sleep(((time.time() - Start)+5) - (time.time() - Start))
+
+        else: 
+            print("Error: code took longer than 10 minutes to run. Rewite the code or run it on different core's to ensure each loop through all collections take less than 10 minutes")
+            break 
 
 #Error if credentials are wrong 
 except Exception as error: 
